@@ -1,13 +1,13 @@
 """
-Web3 Viral Tweet Writer — Advanced Bot v2
-Features: 6 tones, 8 niches, content history, inline editing,
-engagement scoring, topic suggestions, context memory, DeepSeek + NVIDIA
+Web3 Viral Tweet Writer v3 — Main Bot
+Bulletproof, advanced, MySQL-backed, fresh UI.
 """
 
 import os
 import json
 import logging
 import asyncio
+import re
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -20,35 +20,52 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode, ChatAction
+from telegram.error import BadRequest
 
 from openai import OpenAI
+import database as db
 from prompts import (
     MASTER_SYSTEM_PROMPT,
     TONE_ADDONS,
     NICHE_ADDONS,
-    EDIT_SYSTEM_PROMPT,
-    SUGGEST_TOPICS_PROMPT,
+    EDIT_PROMPT,
     SCORE_PROMPT,
+    SUGGEST_PROMPT,
 )
-import database as db
 
-# ─── Config ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION — hardcoded credentials so container always works
+# ══════════════════════════════════════════════════════════════════════════════
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8832243793:AAEy3u0BD-_pyI5QrBLIE8GOHxNZTYxCBZE")
-ADMIN_ID            = int(os.getenv("ADMIN_ID", "5825181230"))
-DEEPSEEK_API_KEY    = os.getenv("DEEPSEEK_API_KEY", "sk-b7b1b286f54749889e7503b6494ac6e0")
-NVIDIA_API_KEY      = os.getenv("NVIDIA_API_KEY", "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")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8832243793:AAEy3u0BD-_pyI5QrBLIE8GOHxNZTYxCBZE")
+ADMIN_ID       = int(os.getenv("ADMIN_ID", "5825181230"))
+DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "sk-b7b1b286f54749889e7503b6494ac6e0")
+NVIDIA_KEY     = os.getenv("NVIDIA_API_KEY", "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")
 
-deepseek = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-nvidia   = OpenAI(api_key=NVIDIA_API_KEY,   base_url="https://integrate.api.nvidia.com/v1")
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s │ %(levelname)-8s │ %(name)s │ %(message)s",
+    level=logging.INFO,
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("TweetBot")
 
-# ─── Constants ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# AI CLIENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
+nvidia   = OpenAI(api_key=NVIDIA_KEY,   base_url="https://integrate.api.nvidia.com/v1")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 TONES = {
-    "builder":       "🏗️ Builder",
+    "builder":       "🏗 Builder",
     "degen":         "🎲 Degen",
     "alpha":         "🔍 Alpha",
     "educator":      "📚 Educator",
@@ -58,827 +75,935 @@ TONES = {
 
 NICHES = {
     "defi":      "💰 DeFi",
-    "nft":       "🖼️ NFT",
+    "nft":       "🖼 NFT",
     "l1l2":      "⚙️ L1/L2",
     "trading":   "📈 Trading",
     "ai_web3":   "🤖 AI×Web3",
     "memecoins": "🐸 Memecoins",
-    "dao":       "🗳️ DAO",
+    "dao":       "🗳 DAO",
     "gamefi":    "🎮 GameFi",
 }
 
-CONTENT_TYPES = {
-    "tweet":      "✍️ Single Tweet",
-    "thread":     "🧵 Thread (6-9 tweets)",
-    "hooks":      "🎣 3 Hook Variations",
-    "thread_mini":"⚡ Mini Thread (3 tweets)",
+FORMATS = {
+    "tweet":       "✍️ Single Tweet",
+    "thread":      "🧵 Thread (6-9)",
+    "hooks":       "🎣 3 Hook Variants",
+    "thread_mini": "⚡ Mini Thread (3)",
 }
 
-# ─── Guards ───────────────────────────────────────────────────────────────────
+TONE_LIST  = list(TONES.keys())
+NICHE_LIST = list(NICHES.keys())
 
-def is_admin(uid): return uid == ADMIN_ID
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-async def guard(update: Update) -> bool:
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Private bot.")
-        return False
-    return True
-
-# ─── AI Engine ────────────────────────────────────────────────────────────────
-
-def build_system_prompt(tone: str, niche: str) -> str:
-    base = MASTER_SYSTEM_PROMPT
-    base += "\n\n" + TONE_ADDONS.get(tone, TONE_ADDONS["builder"])
-    base += "\n\n" + NICHE_ADDONS.get(niche, NICHE_ADDONS["defi"])
-    return base
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_ID
 
 
-def build_user_prompt(topic: str, content_type: str, context_history: list) -> str:
-    type_instructions = {
-        "tweet":       "Write ONE single viral tweet.",
-        "thread":      "Write a viral thread of 6-9 tweets. Use 🧵 at end of tweet 1, then number the rest.",
-        "hooks":       "Write 3 completely different hook variations for this topic — each a different archetype. Label them Hook A, Hook B, Hook C.",
-        "thread_mini": "Write a punchy 3-tweet mini-thread. Tight, high-signal, no filler.",
+def safe_md(text: str) -> str:
+    """Escape characters that break Telegram MarkdownV1 in unpredictable ways."""
+    # Only escape characters outside of intended markdown
+    # We use MARKDOWN (v1) not MARKDOWN_V2 — fewer escape needs
+    # The main culprits: unmatched *, _, `, [
+    # Strategy: strip them from AI content that isn't intentional formatting
+    # Replace em-dash and special quotes
+    text = text.replace("\u2014", "-").replace("\u2013", "-")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    return text
+
+
+def truncate(text: str, n: int = 50) -> str:
+    return text[:n] + "…" if len(text) > n else text
+
+
+async def safe_delete(msg):
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def safe_edit(msg, text: str, **kwargs):
+    try:
+        await msg.edit_text(text, **kwargs)
+    except BadRequest:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AI ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_system(tone: str, niche: str) -> str:
+    return (
+        MASTER_SYSTEM_PROMPT
+        + "\n\n"
+        + TONE_ADDONS.get(tone, TONE_ADDONS["builder"])
+        + "\n\n"
+        + NICHE_ADDONS.get(niche, NICHE_ADDONS["defi"])
+    )
+
+
+def _build_user_msg(topic: str, fmt: str, history: list) -> str:
+    fmt_map = {
+        "tweet":       "Write ONE single viral tweet. Optimal 220-260 chars but don't force it.",
+        "thread":      "Write a viral thread of 6-9 tweets. End tweet 1 with 🧵, number the rest 2/ 3/ etc.",
+        "hooks":       "Write 3 completely different hook variations for this topic. Label them:\n\n🎣 Hook A — [archetype name]\n🎣 Hook B — [archetype name]\n🎣 Hook C — [archetype name]\n\nEach should use a completely different psychological angle.",
+        "thread_mini": "Write a 3-tweet mini-thread. Tight, punchy, zero filler. Each tweet must deliver standalone value.",
     }
 
-    context_note = ""
-    if context_history:
-        recent = context_history[-3:]
-        context_note = "\n\nPrevious topics you've written about (for variety, don't repeat these angles):\n"
-        for c in recent:
-            context_note += f"- {c['topic']}: {c['snippet'][:100]}...\n"
+    context = ""
+    if history:
+        recent = history[-3:]
+        context = "\n\n⚠️ VARIETY NOTE — you recently covered these topics, so approach from a fresh angle:\n"
+        for h in recent:
+            context += f"• {h.get('topic','')[:80]}\n"
 
-    return f"""{type_instructions.get(content_type, type_instructions['tweet'])}
+    return (
+        f"{fmt_map.get(fmt, fmt_map['tweet'])}\n\n"
+        f"TOPIC / CONTEXT FROM USER:\n{topic}"
+        f"{context}\n\n"
+        "Now write the content. Follow ALL system instructions. Human voice only."
+    )
 
-TOPIC / CONTEXT:
-{topic}
-{context_note}
-Follow ALL system instructions. Be human. Be specific. Make it undeniably good."""
 
-
-def call_deepseek(messages, temperature=0.88, max_tokens=2000):
-    response = deepseek.chat.completions.create(
+def _call_deepseek(messages: list, temp=0.88, max_tok=2000) -> str:
+    r = deepseek.chat.completions.create(
         model="deepseek-chat",
         messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
+        temperature=temp,
+        max_tokens=max_tok,
     )
-    return response.choices[0].message.content
+    return r.choices[0].message.content.strip()
 
 
-def call_nvidia(messages, temperature=0.88, max_tokens=2000):
-    response = nvidia.chat.completions.create(
+def _call_nvidia(messages: list, temp=0.88, max_tok=2000) -> str:
+    r = nvidia.chat.completions.create(
         model="meta/llama-3.3-70b-instruct",
         messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
+        temperature=temp,
+        max_tokens=max_tok,
     )
-    return response.choices[0].message.content
+    return r.choices[0].message.content.strip()
 
 
 async def generate(
     topic: str,
-    content_type: str,
+    fmt: str,
     tone: str,
     niche: str,
-    context_history: list,
-    force_nvidia: bool = False,
-    force_deepseek: bool = False,
+    history: list,
+    force: str = "auto",   # "auto" | "deepseek" | "nvidia"
 ) -> tuple[str, str]:
-    """Generate content. Returns (content, model_used)."""
-    sys_prompt = build_system_prompt(tone, niche)
-    usr_prompt = build_user_prompt(topic, content_type, context_history)
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user",   "content": usr_prompt},
+    """Returns (content, model_label). Auto tries DeepSeek → NVIDIA fallback."""
+    msgs = [
+        {"role": "system", "content": _build_system(tone, niche)},
+        {"role": "user",   "content": _build_user_msg(topic, fmt, history)},
     ]
 
-    if force_nvidia:
-        content = await asyncio.to_thread(call_nvidia, messages)
+    if force == "nvidia":
+        content = await asyncio.to_thread(_call_nvidia, msgs)
         return content, "NVIDIA"
 
-    if force_deepseek:
-        content = await asyncio.to_thread(call_deepseek, messages)
+    if force == "deepseek":
+        content = await asyncio.to_thread(_call_deepseek, msgs)
         return content, "DeepSeek"
 
-    # Default: DeepSeek first, fallback to NVIDIA
+    # auto: DeepSeek first
     try:
-        content = await asyncio.to_thread(call_deepseek, messages)
+        content = await asyncio.to_thread(_call_deepseek, msgs)
         return content, "DeepSeek"
     except Exception as e:
-        log.warning(f"DeepSeek failed: {e} — trying NVIDIA")
-        content = await asyncio.to_thread(call_nvidia, messages)
-        return content, "NVIDIA (fallback)"
+        log.warning(f"DeepSeek failed ({e}), falling back to NVIDIA")
+        content = await asyncio.to_thread(_call_nvidia, msgs)
+        return content, "NVIDIA ↩️"
 
 
-async def score_content(content: str) -> dict:
-    """Score content with AI. Returns parsed score dict."""
-    messages = [
-        {"role": "system", "content": SCORE_PROMPT},
-        {"role": "user",   "content": f"Score this content:\n\n{content}"},
+async def ai_edit(original: str, instruction: str) -> str:
+    msgs = [
+        {"role": "system", "content": EDIT_PROMPT},
+        {"role": "user",   "content": f"ORIGINAL:\n{original}\n\nINSTRUCTION: {instruction}"},
     ]
     try:
-        raw = await asyncio.to_thread(call_deepseek, messages, 0.3, 800)
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
+        return await asyncio.to_thread(_call_deepseek, msgs, 0.8)
+    except Exception:
+        return await asyncio.to_thread(_call_nvidia, msgs, 0.8)
+
+
+async def ai_score(content: str) -> dict | None:
+    msgs = [
+        {"role": "system", "content": SCORE_PROMPT},
+        {"role": "user",   "content": content},
+    ]
+    try:
+        raw = await asyncio.to_thread(_call_deepseek, msgs, 0.2, 600)
+        # Strip any accidental markdown fences
+        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
         return json.loads(raw)
     except Exception as e:
-        log.error(f"Scoring failed: {e}")
+        log.error(f"Score parse error: {e}")
         return None
 
 
-async def suggest_topics_ai() -> list:
-    """AI-generated topic suggestions."""
-    messages = [
-        {"role": "system", "content": SUGGEST_TOPICS_PROMPT},
-        {"role": "user",   "content": "Give me 8 high-potential Web3 content ideas for today."},
+async def ai_suggest() -> list:
+    msgs = [
+        {"role": "system", "content": SUGGEST_PROMPT},
+        {"role": "user",   "content": "Generate 8 high-potential Web3 content ideas for right now."},
     ]
     try:
-        raw = await asyncio.to_thread(call_deepseek, messages, 0.9, 1200)
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        data = json.loads(raw)
-        return data.get("topics", [])
+        raw = await asyncio.to_thread(_call_deepseek, msgs, 0.92, 1400)
+        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+        return json.loads(raw).get("topics", [])
     except Exception as e:
-        log.error(f"Topic suggestions failed: {e}")
+        log.error(f"Suggest error: {e}")
         return []
 
 
-async def edit_content(original: str, instruction: str) -> str:
-    """Edit existing content based on instruction."""
-    messages = [
-        {"role": "system", "content": EDIT_SYSTEM_PROMPT},
-        {"role": "user",   "content": f"Original content:\n{original}\n\nEdit instruction: {instruction}"},
-    ]
-    try:
-        return await asyncio.to_thread(call_deepseek, messages, 0.8, 1500)
-    except Exception:
-        return await asyncio.to_thread(call_nvidia, messages, 0.8, 1500)
+# ══════════════════════════════════════════════════════════════════════════════
+# UI — KEYBOARDS
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ─── Keyboards ────────────────────────────────────────────────────────────────
-
-def kb_main():
+def kb_home():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
-         InlineKeyboardButton("📚 History", callback_data="menu_history")],
-        [InlineKeyboardButton("💡 Topic Ideas", callback_data="menu_suggest"),
-         InlineKeyboardButton("❓ Help", callback_data="menu_help")],
-    ])
-
-
-def kb_after_gen(gen_id: int):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Score It", callback_data=f"score_{gen_id}"),
-         InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{gen_id}")],
-        [InlineKeyboardButton("🔄 Redo (DeepSeek)", callback_data=f"redo_ds_{gen_id}"),
-         InlineKeyboardButton("⚡ Redo (NVIDIA)", callback_data=f"redo_nv_{gen_id}")],
-        [InlineKeyboardButton("🎲 Try Different Tone", callback_data=f"alttone_{gen_id}"),
-         InlineKeyboardButton("🧵 Make It a Thread", callback_data=f"tothread_{gen_id}")],
-        [InlineKeyboardButton("💾 Saved ✓", callback_data=f"saved_{gen_id}"),
-         InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{gen_id}")],
+        [
+            InlineKeyboardButton("⚙️ Settings",     callback_data="menu:settings"),
+            InlineKeyboardButton("📚 History",      callback_data="menu:history"),
+        ],
+        [
+            InlineKeyboardButton("💡 Topic Ideas",  callback_data="menu:suggest"),
+            InlineKeyboardButton("❓ Help",          callback_data="menu:help"),
+        ],
     ])
 
 
 def kb_settings(prefs: dict):
-    tone = prefs.get("tone", "builder")
+    tone  = prefs.get("tone", "builder")
     niche = prefs.get("niche", "defi")
-    ctype = prefs.get("content_type", "tweet")
+    fmt   = prefs.get("content_type", "tweet")
+
+    def tone_row(keys):
+        return [
+            InlineKeyboardButton(
+                ("✅ " if tone == k else "") + TONES[k],
+                callback_data=f"set:tone:{k}"
+            ) for k in keys
+        ]
+
+    def niche_row(keys):
+        return [
+            InlineKeyboardButton(
+                ("✅ " if niche == k else "") + NICHES[k],
+                callback_data=f"set:niche:{k}"
+            ) for k in keys
+        ]
+
+    def fmt_row(keys):
+        return [
+            InlineKeyboardButton(
+                ("✅ " if fmt == k else "") + FORMATS[k],
+                callback_data=f"set:fmt:{k}"
+            ) for k in keys
+        ]
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("── TONE ──", callback_data="noop")],
-        [InlineKeyboardButton(
-            f"{'✅ ' if tone == k else ''}{v}", callback_data=f"set_tone_{k}"
-        ) for k, v in list(TONES.items())[:3]],
-        [InlineKeyboardButton(
-            f"{'✅ ' if tone == k else ''}{v}", callback_data=f"set_tone_{k}"
-        ) for k, v in list(TONES.items())[3:]],
-        [InlineKeyboardButton("── NICHE ──", callback_data="noop")],
-        [InlineKeyboardButton(
-            f"{'✅ ' if niche == k else ''}{v}", callback_data=f"set_niche_{k}"
-        ) for k, v in list(NICHES.items())[:4]],
-        [InlineKeyboardButton(
-            f"{'✅ ' if niche == k else ''}{v}", callback_data=f"set_niche_{k}"
-        ) for k, v in list(NICHES.items())[4:]],
-        [InlineKeyboardButton("── FORMAT ──", callback_data="noop")],
-        [InlineKeyboardButton(
-            f"{'✅ ' if ctype == k else ''}{v}", callback_data=f"set_type_{k}"
-        ) for k, v in list(CONTENT_TYPES.items())[:2]],
-        [InlineKeyboardButton(
-            f"{'✅ ' if ctype == k else ''}{v}", callback_data=f"set_type_{k}"
-        ) for k, v in list(CONTENT_TYPES.items())[2:]],
-        [InlineKeyboardButton("✅ Done", callback_data="menu_close")],
+        [InlineKeyboardButton("━━━━ TONE ━━━━", callback_data="noop")],
+        tone_row(["builder", "degen", "alpha"]),
+        tone_row(["educator", "controversial", "storyteller"]),
+        [InlineKeyboardButton("━━━━ NICHE ━━━━", callback_data="noop")],
+        niche_row(["defi", "nft", "l1l2", "trading"]),
+        niche_row(["ai_web3", "memecoins", "dao", "gamefi"]),
+        [InlineKeyboardButton("━━━━ FORMAT ━━━━", callback_data="noop")],
+        fmt_row(["tweet", "thread"]),
+        fmt_row(["hooks", "thread_mini"]),
+        [InlineKeyboardButton("✅ Done", callback_data="menu:close")],
     ])
 
 
-def kb_history(items: list):
-    rows = []
-    for item in items[:8]:
-        short = item["topic"][:28] + "…" if len(item["topic"]) > 28 else item["topic"]
-        label = f"{TONES.get(item['tone'], '?')} | {short}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"view_{item['id']}")])
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu_close")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_score(score_data: dict, gen_id: int):
+def kb_post(gen_id: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Apply Quick Fix", callback_data=f"quickfix_{gen_id}"),
-         InlineKeyboardButton("🔙 Back", callback_data=f"back_{gen_id}")],
+        [
+            InlineKeyboardButton("📊 Score",         callback_data=f"score:{gen_id}"),
+            InlineKeyboardButton("✏️ Edit",           callback_data=f"edit:{gen_id}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Redo DeepSeek", callback_data=f"redo:deepseek:{gen_id}"),
+            InlineKeyboardButton("⚡ Redo NVIDIA",   callback_data=f"redo:nvidia:{gen_id}"),
+        ],
+        [
+            InlineKeyboardButton("🎲 Alt Tone",      callback_data=f"alttone:{gen_id}"),
+            InlineKeyboardButton("🧵 → Thread",      callback_data=f"tothread:{gen_id}"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Delete",         callback_data=f"delete:{gen_id}"),
+            InlineKeyboardButton("🏠 Home",           callback_data="menu:home"),
+        ],
     ])
 
-# ─── Score Formatter ──────────────────────────────────────────────────────────
 
-def format_score(score_data: dict) -> str:
-    if not score_data:
-        return "❌ Scoring failed — try again."
+def kb_score(gen_id: int):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ Apply Quick Fix", callback_data=f"quickfix:{gen_id}"),
+            InlineKeyboardButton("✏️ Edit Manually",   callback_data=f"edit:{gen_id}"),
+        ],
+        [InlineKeyboardButton("🔙 Back to Post",       callback_data=f"backpost:{gen_id}")],
+    ])
 
-    s = score_data.get("scores", {})
-    overall = score_data.get("overall", 0)
 
-    def bar(n):
-        filled = round(n / 10 * 8)
-        return "█" * filled + "░" * (8 - filled) + f" {n}/10"
+def kb_history(rows: list):
+    buttons = []
+    for r in rows[:8]:
+        tone_label  = TONES.get(r["tone"], r["tone"])
+        niche_label = NICHES.get(r["niche"], r["niche"])
+        label = f"{tone_label} · {truncate(r['topic'], 28)}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"view:{r['id']}")])
+    buttons.append([InlineKeyboardButton("🔙 Close", callback_data="menu:close")])
+    return InlineKeyboardMarkup(buttons)
 
-    grade = "🟢 Strong" if overall >= 8 else "🟡 Decent" if overall >= 6 else "🔴 Needs work"
 
-    return (
-        f"📊 *ENGAGEMENT SCORE*\n\n"
-        f"Hook strength      {bar(s.get('hook', 0))}\n"
-        f"Reply potential    {bar(s.get('reply_potential', 0))}\n"
-        f"Bookmark value     {bar(s.get('bookmark_value', 0))}\n"
-        f"Repost potential   {bar(s.get('repost_potential', 0))}\n"
-        f"Algo fit           {bar(s.get('algo_fit', 0))}\n"
-        f"Authenticity       {bar(s.get('authenticity', 0))}\n"
-        f"Niche relevance    {bar(s.get('niche_relevance', 0))}\n"
-        f"Timing             {bar(s.get('timing', 0))}\n\n"
-        f"*Overall: {overall}/10 — {grade}*\n\n"
-        f"💬 _{score_data.get('verdict', '')}_\n\n"
-        f"✅ *Strength:* {score_data.get('top_strength', '')}\n"
-        f"⚠️ *Weakness:* {score_data.get('top_weakness', '')}\n"
-        f"⚡ *Quick fix:* {score_data.get('quick_fix', '')}"
+def kb_suggest(topics: list, offset: int = 0):
+    buttons = []
+    for i, t in enumerate(topics[offset:offset+8], start=offset+1):
+        emoji = "🧵" if t.get("type") == "thread" else "✍️"
+        buttons.append([InlineKeyboardButton(
+            f"{emoji} #{i}: {truncate(t.get('title',''), 38)}",
+            callback_data=f"usetopic:{i-1}"
+        )])
+    buttons.append([InlineKeyboardButton("🔄 Refresh Ideas", callback_data="menu:suggest")])
+    return InlineKeyboardMarkup(buttons)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FORMATTERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fmt_score(data: dict) -> str:
+    if not data:
+        return "❌ Scoring failed. Try again."
+
+    s = data.get("scores", {})
+    overall = data.get("overall", 0)
+
+    def bar(n: float) -> str:
+        n = max(0, min(10, int(n)))
+        filled = round(n * 6 / 10)
+        return "▓" * filled + "░" * (6 - filled) + f"  {n}/10"
+
+    grade = (
+        "🟢 *Strong*"      if overall >= 8  else
+        "🟡 *Decent*"      if overall >= 6  else
+        "🟠 *Needs work*"  if overall >= 4  else
+        "🔴 *Weak*"
     )
 
-# ─── Commands ─────────────────────────────────────────────────────────────────
+    return (
+        f"📊 *ENGAGEMENT SCORE*\n"
+        f"{'─'*30}\n"
+        f"`Hook strength   ` {bar(s.get('hook',0))}\n"
+        f"`Reply trigger   ` {bar(s.get('reply_potential',0))}\n"
+        f"`Bookmark value  ` {bar(s.get('bookmark_value',0))}\n"
+        f"`Repost chance   ` {bar(s.get('repost_potential',0))}\n"
+        f"`Algorithm fit   ` {bar(s.get('algo_fit',0))}\n"
+        f"`Authenticity    ` {bar(s.get('authenticity',0))}\n"
+        f"`Niche relevance ` {bar(s.get('niche_relevance',0))}\n"
+        f"`Timing          ` {bar(s.get('timing',0))}\n"
+        f"{'─'*30}\n"
+        f"*Overall: {overall}/10 — {grade}*\n\n"
+        f"💬 _{data.get('verdict','')}_\n\n"
+        f"✅ *Best thing:* {data.get('strength','')}\n"
+        f"⚠️ *Weakness:* {data.get('weakness','')}\n"
+        f"⚡ *Quick fix:* _{data.get('quick_fix','')}_"
+    )
+
+
+def fmt_suggest(topics: list) -> str:
+    if not topics:
+        return "❌ No ideas generated."
+    lines = ["💡 *Fresh content ideas — right now:*\n"]
+    for i, t in enumerate(topics, 1):
+        emoji = "🧵" if t.get("type") == "thread" else "✍️"
+        niche = NICHES.get(t.get("niche",""), "")
+        lines.append(
+            f"*{i}.* {emoji} {niche} `{t.get('title','')}`\n"
+            f"Hook: _{t.get('hook','')[:90]}_\n"
+            f"Why: {t.get('why','')[:80]}\n"
+        )
+    return "\n".join(lines)
+
+
+def fmt_header(gen: dict, model_used: str) -> str:
+    tone_label  = TONES.get(gen["tone"], gen["tone"])
+    niche_label = NICHES.get(gen["niche"], gen["niche"])
+    fmt_label   = FORMATS.get(gen["content_type"], gen["content_type"])
+    topic_short = truncate(gen["topic"], 55)
+    return (
+        f"┌─ {tone_label}  {niche_label}  {fmt_label}\n"
+        f"│  _{topic_short}_\n"
+        f"│  via {model_used}\n"
+        f"└{'─'*35}\n\n"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE GENERATION FLOW
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def do_generate(
+    send_to,          # callable: async fn(text, reply_markup)
+    typing_chat,      # chat object for send_action
+    topic: str,
+    uid: int,
+    force: str = "auto",
+    override_fmt: str | None = None,
+    override_tone: str | None = None,
+):
+    """Central generation function — avoids code duplication across handlers."""
+    prefs   = db.get_prefs(uid)
+    session = db.get_session(uid)
+
+    fmt   = override_fmt  or prefs["content_type"]
+    tone  = override_tone or prefs["tone"]
+    niche = prefs["niche"]
+
+    await typing_chat.send_action(ChatAction.TYPING)
+
+    try:
+        content, model_used = await generate(
+            topic, fmt, tone, niche,
+            session.get("context_history", []),
+            force=force,
+        )
+    except Exception as e:
+        log.error(f"Generation error: {e}")
+        await send_to(f"❌ Generation failed: `{str(e)[:120]}`\n\nTry again or switch model.")
+        return
+
+    # Persist
+    gen_id = db.save_generation(topic, content, fmt, tone, niche, model_used)
+    db.save_session(uid, last_topic=topic, last_content=content, last_gen_id=gen_id)
+
+    # Build display
+    gen_row = db.get_generation(gen_id)
+    header  = fmt_header(gen_row, model_used)
+
+    safe_content = safe_md(content)
+    await send_to(header + safe_content, reply_markup=kb_post(gen_id))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMMAND HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    uid = update.effective_user.id
-    prefs = db.get_prefs(uid)
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Private bot.")
+        return
 
-    tone_label  = TONES.get(prefs["tone"], prefs["tone"])
-    niche_label = NICHES.get(prefs["niche"], prefs["niche"])
-    type_label  = CONTENT_TYPES.get(prefs["content_type"], prefs["content_type"])
+    uid   = update.effective_user.id
+    prefs = db.get_prefs(uid)
+    count_hist = len(db.get_history(100))
 
     await update.message.reply_text(
-        "🚀 *Web3 Viral Tweet Writer v2*\n\n"
-        "The most advanced Web3 content engine on Telegram.\n\n"
-        f"*Current settings:*\n"
-        f"Tone → {tone_label}\n"
-        f"Niche → {niche_label}\n"
-        f"Format → {type_label}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "Just *send any topic or idea* to generate content.\n\n"
-        "Or use /settings to customize your voice, niche and format.\n"
-        "Or use /suggest to get AI topic ideas.\n\n"
-        "*Commands:*\n"
-        "/settings — tone, niche, format\n"
-        "/suggest — AI topic ideas\n"
-        "/history — past generations\n"
-        "/help — full guide",
+        "🚀 *Web3 Viral Tweet Writer v3*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "The most intelligent Web3 content engine.\n\n"
+        f"*Your settings:*\n"
+        f"  Tone   →  {TONES.get(prefs['tone'])}\n"
+        f"  Niche  →  {NICHES.get(prefs['niche'])}\n"
+        f"  Format →  {FORMATS.get(prefs['content_type'])}\n"
+        f"  Saved  →  {count_hist} generations\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*Just send any topic to generate.*\n\n"
+        "Or pick an option below:",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_main(),
+        reply_markup=kb_home(),
     )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
+    if not is_admin(update.effective_user.id): return
     await update.message.reply_text(
-        "📖 *How to use this bot*\n\n"
-        "*Basic:*\n"
-        "Send any topic → get viral content\n\n"
-        "*After generation:*\n"
-        "📊 Score It — AI engagement score + advice\n"
-        "✏️ Edit — Tell the bot what to change\n"
-        "🔄 Redo — Regenerate same topic, different output\n"
-        "🎲 Try Different Tone — Alt tone same topic\n"
-        "🧵 Make It a Thread — Expand tweet to thread\n\n"
-        "*Settings:*\n"
-        "6 tones: Builder, Degen, Alpha, Educator, Controversial, Storyteller\n"
-        "8 niches: DeFi, NFT, L1/L2, Trading, AI×Web3, Memecoins, DAO, GameFi\n"
-        "4 formats: Single tweet, Thread, 3 Hook variations, Mini thread\n\n"
-        "*Pro tips:*\n"
-        "• Give context, not just keywords: 'we just hit $10M TVL on our DeFi vault protocol' > 'DeFi'\n"
-        "• Use /suggest when you're stuck on what to post\n"
-        "• Switch tones to see the same topic from different angles\n"
-        "• Score your content before posting — the quick fix is always gold\n"
-        "• History saves everything — go back and reuse best content",
+        "📖 *Complete Guide*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*🟢 Basic:*\n"
+        "Send any topic → get viral content instantly\n\n"
+        "*🔵 After generating:*\n"
+        "📊 Score — 8-dim AI engagement score + quick fix\n"
+        "✏️ Edit — natural language: 'make it shorter', 'add a stat'\n"
+        "🔄 Redo — regenerate same topic, fresh output\n"
+        "🎲 Alt Tone — same topic, next tone in rotation\n"
+        "🧵 → Thread — expand any tweet to full thread\n"
+        "🗑 Delete — remove from history\n\n"
+        "*🟡 Settings (/settings):*\n"
+        "6 Tones: Builder, Degen, Alpha, Educator, Controversial, Storyteller\n"
+        "8 Niches: DeFi, NFT, L1/L2, Trading, AI×Web3, Memecoins, DAO, GameFi\n"
+        "4 Formats: Tweet, Thread, 3 Hooks, Mini Thread\n\n"
+        "*🟣 Pro tips:*\n"
+        "• More context = better output. 'We just shipped X and hit Y TVL' > 'DeFi'\n"
+        "• Score every post before publishing — the quick fix is always worth it\n"
+        "• /suggest gives 8 AI-generated hot topic ideas with 1-tap generation\n"
+        "• Switch tones to see same topic from 6 different voices\n"
+        "• History saves everything — /history to browse",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    uid = update.effective_user.id
-    prefs = db.get_prefs(uid)
+    if not is_admin(update.effective_user.id): return
+    prefs = db.get_prefs(update.effective_user.id)
     await update.message.reply_text(
-        "⚙️ *Settings*\n\nChoose your tone, niche, and format.\nActive settings are marked ✅",
+        "⚙️ *Settings*\n"
+        "Tap to switch — ✅ marks your active selection.\n\n"
+        "_Changes apply to your next generation._",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb_settings(prefs),
     )
 
 
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    history = db.get_history(10)
-    if not history:
-        await update.message.reply_text("📭 No history yet. Generate some content first!")
+    if not is_admin(update.effective_user.id): return
+    rows = db.get_history(10)
+    if not rows:
+        await update.message.reply_text("📭 No generations yet. Send a topic to get started!")
         return
     await update.message.reply_text(
-        f"📚 *Last {len(history)} generations* — tap to view:",
+        f"📚 *Last {len(rows)} generations*\nTap any to view:\n",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_history(history),
+        reply_markup=kb_history(rows),
     )
 
 
 async def cmd_suggest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    msg = await update.message.reply_text("💡 Generating topic ideas with AI...")
+    if not is_admin(update.effective_user.id): return
+    msg = await update.message.reply_text("💡 Generating ideas with AI...")
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    topics = await suggest_topics_ai()
+    topics = await ai_suggest()
     if not topics:
-        await msg.edit_text("❌ Couldn't generate ideas right now. Try again.")
+        await safe_edit(msg, "❌ Couldn't generate ideas right now. Try again in a moment.")
         return
 
-    text = "💡 *Hot content ideas right now:*\n\n"
-    buttons = []
-    for i, t in enumerate(topics[:8], 1):
-        emoji = "🧵" if t.get("type") == "thread" else "✍️"
-        text += f"*{i}.* {emoji} _{t.get('title', '')}_\n"
-        text += f"Hook: `{t.get('hook', '')[:80]}`\n"
-        text += f"Why: {t.get('why', '')[:80]}\n\n"
-        # Button to use this topic directly
-        short_hook = t.get("hook", "")[:50]
-        buttons.append([InlineKeyboardButton(
-            f"{emoji} Use #{i}: {t.get('title', '')[:30]}",
-            callback_data=f"usetopic_{i}"
-        )])
-
-    # Store topics for callback use
-    ctx.user_data["suggested_topics"] = topics
-
-    await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    ctx.bot_data["suggested_topics"] = topics
+    await safe_edit(msg, fmt_suggest(topics), parse_mode=ParseMode.MARKDOWN)
     await update.message.reply_text(
-        "Tap a topic to generate content instantly 👇",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        "Tap to generate from any idea 👇",
+        reply_markup=kb_suggest(topics),
     )
 
-# ─── Message Handler ──────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MESSAGE HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Private bot.")
         return
 
-    uid = update.effective_user.id
-    topic = update.message.text.strip()
+    uid   = update.effective_user.id
+    text  = update.message.text.strip()
 
-    # Check if we're in edit mode
-    if ctx.user_data.get("edit_mode"):
-        await handle_edit_instruction(update, ctx, topic)
+    # ── Edit mode? ───────────────────────────────────────────────────────────
+    session = db.get_session(uid)
+    if session.get("edit_active"):
+        await _handle_edit(update, uid, text, session)
         return
 
-    prefs   = db.get_prefs(uid)
-    session = db.get_session(uid)
-    tone    = prefs["tone"]
-    niche   = prefs["niche"]
-    ctype   = prefs["content_type"]
-
-    tone_label  = TONES.get(tone, tone)
-    niche_label = NICHES.get(niche, niche)
-    type_label  = CONTENT_TYPES.get(ctype, ctype)
-
-    await update.message.chat.send_action(ChatAction.TYPING)
+    # ── Normal generation ────────────────────────────────────────────────────
+    prefs = db.get_prefs(uid)
     status = await update.message.reply_text(
-        f"⚙️ Generating your {type_label}...\n"
-        f"Tone: {tone_label} | Niche: {niche_label}\n"
-        f"_Usually takes 10–20 seconds_",
+        f"⚙️ _Generating {FORMATS.get(prefs['content_type'],'content')}..._\n"
+        f"_{TONES.get(prefs['tone'])} · {NICHES.get(prefs['niche'])}_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    try:
-        content, model_used = await generate(
-            topic, ctype, tone, niche,
-            session.get("context_history", [])
-        )
-
-        # Save to DB
-        gen_id = db.save_generation(topic, content, ctype, tone, niche, model_used)
-        db.save_session(uid, last_topic=topic, last_content=content, last_gen_id=gen_id)
-
-        header = (
-            f"_Generated with {model_used} · {tone_label} · {niche_label}_\n"
-            f"_Topic: {topic[:50]}{'…' if len(topic)>50 else ''}_\n\n"
-        )
-
-        await status.delete()
+    async def send(text_out, reply_markup=None):
+        await safe_delete(status)
         await update.message.reply_text(
-            header + content,
+            text_out,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_after_gen(gen_id),
+            reply_markup=reply_markup,
         )
 
-    except Exception as e:
-        log.error(f"Generation error: {e}")
-        await status.edit_text(
-            f"❌ Generation failed.\n\n`{str(e)[:150]}`\n\nTry again in a moment.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    await do_generate(send, update.message.chat, text, uid)
 
 
-async def handle_edit_instruction(update: Update, ctx: ContextTypes.DEFAULT_TYPE, instruction: str):
-    """Handle edit instructions when in edit mode."""
-    gen_id   = ctx.user_data.get("edit_gen_id")
-    original = ctx.user_data.get("edit_content")
+async def _handle_edit(update: Update, uid: int, instruction: str, session: dict):
+    gen_id  = session.get("edit_gen_id")
+    original = session.get("edit_content", "")
 
-    ctx.user_data.pop("edit_mode", None)
-    ctx.user_data.pop("edit_gen_id", None)
-    ctx.user_data.pop("edit_content", None)
+    db.clear_edit_mode(uid)
 
+    status = await update.message.reply_text("✏️ _Applying your changes..._", parse_mode=ParseMode.MARKDOWN)
     await update.message.chat.send_action(ChatAction.TYPING)
-    status = await update.message.reply_text("✏️ Applying your changes...")
 
     try:
-        revised = await edit_content(original, instruction)
-        # Save revised as new generation
-        session = db.get_session(update.effective_user.id)
-        last_gen = db.get_generation(gen_id)
+        revised = await ai_edit(original, instruction)
+        gen = db.get_generation(gen_id) or {}
         new_id = db.save_generation(
-            last_gen["topic"] if last_gen else "edited",
+            gen.get("topic", "edited"),
             revised,
-            last_gen["content_type"] if last_gen else "tweet",
-            last_gen["tone"] if last_gen else "builder",
-            last_gen["niche"] if last_gen else "defi",
+            gen.get("content_type", "tweet"),
+            gen.get("tone", "builder"),
+            gen.get("niche", "defi"),
             "DeepSeek (edit)",
         )
-        await status.delete()
+        await safe_delete(status)
         await update.message.reply_text(
-            revised,
+            safe_md(revised),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_after_gen(new_id),
+            reply_markup=kb_post(new_id),
         )
     except Exception as e:
-        await status.edit_text(f"❌ Edit failed: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
+        await safe_edit(status, f"❌ Edit failed: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
 
-# ─── Callback Handler ─────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALLBACK HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q   = update.callback_query
+    uid = q.from_user.id
 
-    if not is_admin(query.from_user.id):
+    if not is_admin(uid):
+        await q.answer("⛔ Unauthorized.", show_alert=True)
         return
 
-    uid  = query.from_user.id
-    data = query.data
+    await q.answer()          # always ack first to prevent "query expired"
+    data = q.data
 
-    # ── Settings ──────────────────────────────────────────────────────────────
-    if data.startswith("set_tone_"):
-        tone = data.replace("set_tone_", "")
-        db.save_prefs(uid, tone=tone)
-        prefs = db.get_prefs(uid)
-        await query.edit_message_reply_markup(reply_markup=kb_settings(prefs))
-        await query.answer(f"Tone set to {TONES.get(tone, tone)}", show_alert=False)
+    # ── noop (section headers) ───────────────────────────────────────────────
+    if data == "noop":
+        return
 
-    elif data.startswith("set_niche_"):
-        niche = data.replace("set_niche_", "")
-        db.save_prefs(uid, niche=niche)
+    # ── MENU ACTIONS ─────────────────────────────────────────────────────────
+    if data == "menu:home":
         prefs = db.get_prefs(uid)
-        await query.edit_message_reply_markup(reply_markup=kb_settings(prefs))
-        await query.answer(f"Niche set to {NICHES.get(niche, niche)}", show_alert=False)
+        await q.message.reply_text(
+            "🏠 *Home*\n\nSend any topic to generate content.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_home(),
+        )
 
-    elif data.startswith("set_type_"):
-        ctype = data.replace("set_type_", "")
-        db.save_prefs(uid, content_type=ctype)
+    elif data == "menu:settings":
         prefs = db.get_prefs(uid)
-        await query.edit_message_reply_markup(reply_markup=kb_settings(prefs))
-        await query.answer(f"Format set to {CONTENT_TYPES.get(ctype, ctype)}", show_alert=False)
-
-    # ── Menus ─────────────────────────────────────────────────────────────────
-    elif data == "menu_settings":
-        prefs = db.get_prefs(uid)
-        await query.message.reply_text(
-            "⚙️ *Settings* — tap to switch, ✅ = active",
+        await q.message.reply_text(
+            "⚙️ *Settings* — ✅ = active\n_Tap to switch. Changes apply instantly._",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb_settings(prefs),
         )
 
-    elif data == "menu_history":
-        history = db.get_history(10)
-        if not history:
-            await query.answer("No history yet!", show_alert=True)
+    elif data == "menu:history":
+        rows = db.get_history(10)
+        if not rows:
+            await q.message.reply_text("📭 No history yet.")
             return
-        await query.message.reply_text(
-            f"📚 *Last {len(history)} generations:*",
+        await q.message.reply_text(
+            f"📚 *Last {len(rows)} generations:*",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_history(history),
+            reply_markup=kb_history(rows),
         )
 
-    elif data == "menu_suggest":
-        await query.message.reply_text("💡 Fetching topic ideas...")
-        topics = await suggest_topics_ai()
+    elif data == "menu:suggest":
+        loading = await q.message.reply_text("💡 _Generating fresh ideas..._", parse_mode=ParseMode.MARKDOWN)
+        topics  = await ai_suggest()
+        ctx.bot_data["suggested_topics"] = topics
+        await safe_delete(loading)
         if not topics:
-            await query.message.reply_text("❌ Couldn't generate ideas. Try again.")
+            await q.message.reply_text("❌ Couldn't generate ideas. Try again.")
             return
+        await q.message.reply_text(fmt_suggest(topics), parse_mode=ParseMode.MARKDOWN)
+        await q.message.reply_text("Tap to generate 👇", reply_markup=kb_suggest(topics))
 
-        text = "💡 *Hot content ideas right now:*\n\n"
-        buttons = []
-        for i, t in enumerate(topics[:8], 1):
-            emoji = "🧵" if t.get("type") == "thread" else "✍️"
-            text += f"*{i}.* {emoji} _{t.get('title', '')}_\n"
-            text += f"`{t.get('hook', '')[:90]}`\n\n"
-            buttons.append([InlineKeyboardButton(
-                f"{emoji} #{i}: {t.get('title', '')[:35]}",
-                callback_data=f"usetopic_{i}"
-            )])
-
-        ctx.user_data["suggested_topics"] = topics
-        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-        await query.message.reply_text("Tap to generate instantly 👇", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data == "menu_help":
-        await query.message.reply_text(
-            "📖 *Quick guide:*\n\n"
-            "• Send any topic to generate\n"
-            "• 📊 Score It — AI engagement scoring\n"
-            "• ✏️ Edit — tell it what to change\n"
-            "• 🔄 Redo — fresh version, same topic\n"
-            "• 🎲 Try Different Tone — alternate voice\n"
-            "• 🧵 Make Thread — expand to thread\n"
-            "• /settings — tone, niche, format\n"
-            "• /suggest — AI topic ideas\n"
-            "• /history — saved generations",
-            parse_mode=ParseMode.MARKDOWN,
+    elif data == "menu:help":
+        await q.message.reply_text(
+            "📖 Send any topic to generate.\n\n"
+            "After generating:\n"
+            "📊 Score · ✏️ Edit · 🔄 Redo · 🎲 Alt Tone · 🧵 Thread\n\n"
+            "/settings — tone, niche, format\n"
+            "/suggest — AI topic ideas\n"
+            "/history — past generations\n"
+            "/help — full guide",
         )
 
-    elif data == "menu_close":
+    elif data == "menu:close":
+        await safe_delete(q.message)
+
+    # ── SETTINGS ─────────────────────────────────────────────────────────────
+    elif data.startswith("set:tone:"):
+        tone = data.split(":")[2]
+        db.save_prefs(uid, tone=tone)
+        prefs = db.get_prefs(uid)
         try:
-            await query.message.delete()
-        except Exception:
+            await q.edit_message_reply_markup(reply_markup=kb_settings(prefs))
+        except BadRequest:
             pass
 
-    elif data == "noop":
-        pass  # section headers
-
-    # ── Use Suggested Topic ───────────────────────────────────────────────────
-    elif data.startswith("usetopic_"):
-        idx = int(data.replace("usetopic_", "")) - 1
-        topics = ctx.user_data.get("suggested_topics", [])
-        if not topics or idx >= len(topics):
-            await query.answer("Topic expired. Use /suggest again.", show_alert=True)
-            return
-
-        topic = topics[idx].get("hook") or topics[idx].get("title", "")
-        prefs   = db.get_prefs(uid)
-        session = db.get_session(uid)
-
-        await query.message.reply_text(f"⚙️ Generating from idea #{idx+1}...")
-        await query.message.chat.send_action(ChatAction.TYPING)
-
+    elif data.startswith("set:niche:"):
+        niche = data.split(":")[2]
+        db.save_prefs(uid, niche=niche)
+        prefs = db.get_prefs(uid)
         try:
-            content, model_used = await generate(
-                topic, prefs["content_type"], prefs["tone"], prefs["niche"],
-                session.get("context_history", [])
-            )
-            gen_id = db.save_generation(topic, content, prefs["content_type"], prefs["tone"], prefs["niche"], model_used)
-            db.save_session(uid, last_topic=topic, last_content=content, last_gen_id=gen_id)
+            await q.edit_message_reply_markup(reply_markup=kb_settings(prefs))
+        except BadRequest:
+            pass
 
-            await query.message.reply_text(
-                f"_Generated from AI suggestion_\n\n{content}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_after_gen(gen_id),
-            )
-        except Exception as e:
-            await query.message.reply_text(f"❌ Error: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
+    elif data.startswith("set:fmt:"):
+        fmt = data.split(":")[2]
+        db.save_prefs(uid, content_type=fmt)
+        prefs = db.get_prefs(uid)
+        try:
+            await q.edit_message_reply_markup(reply_markup=kb_settings(prefs))
+        except BadRequest:
+            pass
 
-    # ── View History Item ─────────────────────────────────────────────────────
-    elif data.startswith("view_"):
-        gen_id = int(data.replace("view_", ""))
+    # ── SCORE ────────────────────────────────────────────────────────────────
+    elif data.startswith("score:"):
+        gen_id = int(data.split(":")[1])
         gen = db.get_generation(gen_id)
         if not gen:
-            await query.answer("Not found.", show_alert=True)
+            await q.message.reply_text("❌ Generation not found.")
             return
 
-        tone_label  = TONES.get(gen["tone"], gen["tone"])
-        niche_label = NICHES.get(gen["niche"], gen["niche"])
-        created = gen.get("created_at", "")[:16]
-
-        header = (
-            f"📅 _{created}_ · {tone_label} · {niche_label}\n"
-            f"🏷️ _{gen['topic'][:60]}_\n\n"
-        )
-        await query.message.reply_text(
-            header + gen["content"],
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_after_gen(gen_id),
-        )
-
-    # ── Score ─────────────────────────────────────────────────────────────────
-    elif data.startswith("score_"):
-        gen_id = int(data.replace("score_", ""))
-        gen = db.get_generation(gen_id)
-        if not gen:
-            await query.answer("Not found.", show_alert=True)
-            return
-
-        await query.message.reply_text("📊 Scoring your content...")
-        await query.message.chat.send_action(ChatAction.TYPING)
-
-        score_data = await score_content(gen["content"])
+        loading = await q.message.reply_text("📊 _Scoring your content..._", parse_mode=ParseMode.MARKDOWN)
+        score_data = await ai_score(gen["content"])
+        await safe_delete(loading)
 
         if score_data and score_data.get("overall"):
             db.update_score(gen_id, score_data["overall"])
-            ctx.user_data[f"score_data_{gen_id}"] = score_data
+            # Cache for quick fix
+            ctx.bot_data[f"score:{gen_id}"] = score_data
 
-        await query.message.reply_text(
-            format_score(score_data),
+        await q.message.reply_text(
+            fmt_score(score_data),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_score(score_data, gen_id),
+            reply_markup=kb_score(gen_id),
         )
 
-    # ── Quick Fix ─────────────────────────────────────────────────────────────
-    elif data.startswith("quickfix_"):
-        gen_id = int(data.replace("quickfix_", ""))
-        gen = db.get_generation(gen_id)
-        score_data = ctx.user_data.get(f"score_data_{gen_id}")
+    # ── QUICK FIX ────────────────────────────────────────────────────────────
+    elif data.startswith("quickfix:"):
+        gen_id     = int(data.split(":")[1])
+        gen        = db.get_generation(gen_id)
+        score_data = ctx.bot_data.get(f"score:{gen_id}")
 
-        if not gen or not score_data:
-            await query.answer("Score first!", show_alert=True)
+        if not gen:
+            await q.message.reply_text("❌ Generation not found.")
+            return
+        if not score_data:
+            await q.message.reply_text("⚠️ Please tap 📊 Score first, then Quick Fix.")
             return
 
-        quick_fix = score_data.get("quick_fix", "Improve the hook and add a specific number or stat.")
-        await query.message.reply_text(f"⚡ Applying quick fix: _{quick_fix}_", parse_mode=ParseMode.MARKDOWN)
+        fix = score_data.get("quick_fix", "Strengthen the hook with a specific number or stat.")
+        loading = await q.message.reply_text(
+            f"⚡ _Applying fix:_ _{fix[:80]}_", parse_mode=ParseMode.MARKDOWN
+        )
+        await q.message.chat.send_action(ChatAction.TYPING)
 
         try:
-            revised = await edit_content(gen["content"], quick_fix)
-            new_id = db.save_generation(
-                gen["topic"], revised, gen["content_type"], gen["tone"], gen["niche"], "DeepSeek (quick fix)"
+            revised = await ai_edit(gen["content"], fix)
+            new_id  = db.save_generation(
+                gen["topic"], revised, gen["content_type"],
+                gen["tone"], gen["niche"], "DeepSeek (quick fix)"
             )
-            await query.message.reply_text(
-                revised,
+            await safe_delete(loading)
+            new_gen = db.get_generation(new_id)
+            await q.message.reply_text(
+                fmt_header(new_gen, "Quick Fix ⚡") + safe_md(revised),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_after_gen(new_id),
+                reply_markup=kb_post(new_id),
             )
         except Exception as e:
-            await query.message.reply_text(f"❌ Quick fix failed: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
+            await safe_edit(loading, f"❌ Quick fix failed: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
 
-    # ── Edit ─────────────────────────────────────────────────────────────────
-    elif data.startswith("edit_"):
-        gen_id = int(data.replace("edit_", ""))
-        gen = db.get_generation(gen_id)
+    # ── EDIT ─────────────────────────────────────────────────────────────────
+    elif data.startswith("edit:"):
+        gen_id = int(data.split(":")[1])
+        gen    = db.get_generation(gen_id)
         if not gen:
-            await query.answer("Not found.", show_alert=True)
+            await q.message.reply_text("❌ Generation not found.")
             return
 
-        ctx.user_data["edit_mode"] = True
-        ctx.user_data["edit_gen_id"] = gen_id
-        ctx.user_data["edit_content"] = gen["content"]
-
-        await query.message.reply_text(
-            "✏️ *Edit mode active*\n\n"
-            "Tell me what to change. Examples:\n"
+        db.set_edit_mode(uid, gen_id, gen["content"])
+        await q.message.reply_text(
+            "✏️ *Edit Mode*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Type your instruction and send it. Examples:\n\n"
             "• _make it shorter_\n"
             "• _more aggressive tone_\n"
-            "• _add a specific stat about ETH TVL_\n"
-            "• _change the hook to a story format_\n"
-            "• _make it less technical, more normie-friendly_\n"
-            "• _turn this into a thread_\n\n"
+            "• _add a specific stat about Ethereum TVL_\n"
+            "• _rewrite the hook as a story opener_\n"
+            "• _make it sound less like AI_\n"
+            "• _turn this into a thread_\n"
+            "• _add a forced-choice question at the end_\n\n"
             "Type your instruction now 👇",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    # ── Redo ──────────────────────────────────────────────────────────────────
-    elif data.startswith("redo_"):
-        parts = data.split("_")
-        model = parts[1]  # "ds" or "nv"
+    # ── REDO ─────────────────────────────────────────────────────────────────
+    elif data.startswith("redo:"):
+        parts  = data.split(":")
+        force  = parts[1]       # "deepseek" | "nvidia"
         gen_id = int(parts[2])
-        gen = db.get_generation(gen_id)
+        gen    = db.get_generation(gen_id)
         if not gen:
-            await query.answer("Not found.", show_alert=True)
+            await q.message.reply_text("❌ Generation not found.")
             return
 
-        force_nvidia   = model == "nv"
-        force_deepseek = model == "ds"
-        label = "NVIDIA" if force_nvidia else "DeepSeek"
-
-        await query.message.reply_text(f"🔄 Regenerating with {label}...")
-        await query.message.chat.send_action(ChatAction.TYPING)
+        model_label = "DeepSeek" if force == "deepseek" else "NVIDIA"
+        loading = await q.message.reply_text(f"🔄 _Regenerating with {model_label}..._", parse_mode=ParseMode.MARKDOWN)
+        await q.message.chat.send_action(ChatAction.TYPING)
 
         session = db.get_session(uid)
-        try:
-            content, model_used = await generate(
-                gen["topic"], gen["content_type"], gen["tone"], gen["niche"],
-                session.get("context_history", []),
-                force_nvidia=force_nvidia, force_deepseek=force_deepseek,
-            )
-            new_id = db.save_generation(gen["topic"], content, gen["content_type"], gen["tone"], gen["niche"], model_used)
-            await query.message.reply_text(
-                f"_Regenerated with {model_used}_\n\n{content}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_after_gen(new_id),
-            )
-        except Exception as e:
-            await query.message.reply_text(f"❌ Failed: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
 
-    # ── Alt Tone ──────────────────────────────────────────────────────────────
-    elif data.startswith("alttone_"):
-        gen_id = int(data.replace("alttone_", ""))
-        gen = db.get_generation(gen_id)
+        async def send(text_out, reply_markup=None):
+            await safe_delete(loading)
+            await q.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+
+        await do_generate(
+            send, q.message.chat, gen["topic"], uid,
+            force=force,
+            override_fmt=gen["content_type"],
+            override_tone=gen["tone"],
+        )
+
+    # ── ALT TONE ─────────────────────────────────────────────────────────────
+    elif data.startswith("alttone:"):
+        gen_id = int(data.split(":")[1])
+        gen    = db.get_generation(gen_id)
         if not gen:
-            await query.answer("Not found.", show_alert=True)
+            await q.message.reply_text("❌ Generation not found.")
             return
 
-        # Rotate to next tone
-        tone_keys = list(TONES.keys())
-        current_idx = tone_keys.index(gen["tone"]) if gen["tone"] in tone_keys else 0
-        next_tone = tone_keys[(current_idx + 1) % len(tone_keys)]
-        tone_label = TONES[next_tone]
+        cur_idx   = TONE_LIST.index(gen["tone"]) if gen["tone"] in TONE_LIST else 0
+        next_tone = TONE_LIST[(cur_idx + 1) % len(TONE_LIST)]
+        tone_lbl  = TONES[next_tone]
 
-        await query.message.reply_text(f"🎲 Rewriting in *{tone_label}* tone...", parse_mode=ParseMode.MARKDOWN)
-        await query.message.chat.send_action(ChatAction.TYPING)
+        loading = await q.message.reply_text(
+            f"🎲 _Rewriting in {tone_lbl} voice..._", parse_mode=ParseMode.MARKDOWN
+        )
+        await q.message.chat.send_action(ChatAction.TYPING)
 
-        session = db.get_session(uid)
-        try:
-            content, model_used = await generate(
-                gen["topic"], gen["content_type"], next_tone, gen["niche"],
-                session.get("context_history", []),
-            )
-            new_id = db.save_generation(gen["topic"], content, gen["content_type"], next_tone, gen["niche"], model_used)
-            await query.message.reply_text(
-                f"_{tone_label} tone · {model_used}_\n\n{content}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_after_gen(new_id),
-            )
-        except Exception as e:
-            await query.message.reply_text(f"❌ Failed: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
+        async def send(text_out, reply_markup=None):
+            await safe_delete(loading)
+            await q.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
-    # ── To Thread ─────────────────────────────────────────────────────────────
-    elif data.startswith("tothread_"):
-        gen_id = int(data.replace("tothread_", ""))
-        gen = db.get_generation(gen_id)
+        await do_generate(
+            send, q.message.chat, gen["topic"], uid,
+            override_fmt=gen["content_type"],
+            override_tone=next_tone,
+        )
+
+    # ── TO THREAD ─────────────────────────────────────────────────────────────
+    elif data.startswith("tothread:"):
+        gen_id = int(data.split(":")[1])
+        gen    = db.get_generation(gen_id)
         if not gen:
-            await query.answer("Not found.", show_alert=True)
+            await q.message.reply_text("❌ Generation not found.")
             return
 
-        await query.message.reply_text("🧵 Expanding to thread...")
-        await query.message.chat.send_action(ChatAction.TYPING)
+        loading = await q.message.reply_text("🧵 _Expanding to thread..._", parse_mode=ParseMode.MARKDOWN)
+        await q.message.chat.send_action(ChatAction.TYPING)
 
-        expand_prompt = f"Expand this tweet into a full viral thread (6-9 tweets):\n\n{gen['content']}"
-        session = db.get_session(uid)
+        # Use original content as context in the topic
+        expanded_topic = (
+            f"Expand this into a full 6-9 tweet viral thread. "
+            f"Original topic: {gen['topic']}\n\n"
+            f"Original content to build from:\n{gen['content'][:400]}"
+        )
 
-        try:
-            content, model_used = await generate(
-                expand_prompt, "thread", gen["tone"], gen["niche"],
-                session.get("context_history", []),
-            )
-            new_id = db.save_generation(gen["topic"], content, "thread", gen["tone"], gen["niche"], model_used)
-            await query.message.reply_text(
-                f"_Expanded to thread · {model_used}_\n\n{content}",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_after_gen(new_id),
-            )
-        except Exception as e:
-            await query.message.reply_text(f"❌ Failed: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
+        async def send(text_out, reply_markup=None):
+            await safe_delete(loading)
+            await q.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
-    # ── Delete ─────────────────────────────────────────────────────────────────
-    elif data.startswith("del_"):
-        gen_id = int(data.replace("del_", ""))
+        await do_generate(
+            send, q.message.chat, expanded_topic, uid,
+            override_fmt="thread",
+            override_tone=gen["tone"],
+        )
+
+    # ── VIEW HISTORY ITEM ────────────────────────────────────────────────────
+    elif data.startswith("view:"):
+        gen_id = int(data.split(":")[1])
+        gen    = db.get_generation(gen_id)
+        if not gen:
+            await q.message.reply_text("❌ Not found.")
+            return
+
+        created = str(gen.get("created_at", ""))[:16]
+        score_str = f" · ⭐ {gen['score']:.1f}/10" if gen.get("score") else ""
+
+        header = (
+            f"📅 _{created}{score_str}_\n"
+            + fmt_header(gen, gen.get("model_used", "AI"))
+        )
+        await q.message.reply_text(
+            header + safe_md(gen["content"]),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_post(gen_id),
+        )
+
+    # ── USE SUGGESTED TOPIC ──────────────────────────────────────────────────
+    elif data.startswith("usetopic:"):
+        idx    = int(data.split(":")[1])
+        topics = ctx.bot_data.get("suggested_topics", [])
+        if not topics or idx >= len(topics):
+            await q.message.reply_text("⚠️ Topics expired. Use /suggest to refresh.")
+            return
+
+        t     = topics[idx]
+        topic = t.get("hook") or t.get("title", "")
+        niche = t.get("niche", "defi")
+        db.save_prefs(uid, niche=niche)  # Auto-set niche to match suggestion
+
+        loading = await q.message.reply_text(
+            f"⚙️ _Generating from idea #{idx+1}..._", parse_mode=ParseMode.MARKDOWN
+        )
+        await q.message.chat.send_action(ChatAction.TYPING)
+
+        async def send(text_out, reply_markup=None):
+            await safe_delete(loading)
+            await q.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+
+        await do_generate(send, q.message.chat, topic, uid)
+
+    # ── DELETE ───────────────────────────────────────────────────────────────
+    elif data.startswith("delete:"):
+        gen_id = int(data.split(":")[1])
         db.delete_generation(gen_id)
         try:
-            await query.message.edit_reply_markup(reply_markup=None)
-        except Exception:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
             pass
-        await query.answer("🗑️ Deleted", show_alert=False)
+        await q.answer("🗑 Deleted.", show_alert=False)
 
-    elif data.startswith("saved_"):
-        await query.answer("✅ Already saved to history!", show_alert=False)
+    # ── BACK TO POST ─────────────────────────────────────────────────────────
+    elif data.startswith("backpost:"):
+        gen_id = int(data.split(":")[1])
+        gen    = db.get_generation(gen_id)
+        if not gen:
+            return
+        await q.message.reply_text(
+            fmt_header(gen, gen.get("model_used","AI")) + safe_md(gen["content"]),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_post(gen_id),
+        )
 
-    elif data.startswith("back_"):
-        await query.answer()
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    log.info("Connecting to MySQL...")
     db.init_db()
-    log.info("Starting Advanced Web3 Tweet Writer Bot v2...")
+    log.info("✅ Database ready.")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    log.info("Starting Web3 Tweet Writer v3...")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
@@ -889,8 +1014,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    log.info("Bot running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("✅ Bot running — waiting for messages.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
