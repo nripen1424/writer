@@ -34,10 +34,10 @@ import database as db
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN_HERE")
-ADMIN_ID            = int(os.getenv("ADMIN_ID", "0"))
-DEEPSEEK_API_KEY    = os.getenv("DEEPSEEK_API_KEY", "")
-NVIDIA_API_KEY      = os.getenv("NVIDIA_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8832243793:AAEy3u0BD-_pyI5QrBLIE8GOHxNZTYxCBZE")
+ADMIN_ID            = int(os.getenv("ADMIN_ID", "5825181230"))
+DEEPSEEK_API_KEY    = os.getenv("DEEPSEEK_API_KEY", "sk-b7b1b286f54749889e7503b6494ac6e0")
+NVIDIA_API_KEY      = os.getenv("NVIDIA_API_KEY", "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")
 
 deepseek = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 nvidia   = OpenAI(api_key=NVIDIA_API_KEY,   base_url="https://integrate.api.nvidia.com/v1")
