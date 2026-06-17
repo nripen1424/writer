@@ -188,7 +188,7 @@ DAO/GOVERNANCE NICHE:
 - Hot topics 2026: AI-assisted governance, on-chain reputation, delegation markets
 
 GAMEFI NICHE:
-- Audience: gamers, game developers, play-to-earn participants
+- Audience: gamers, game developers, play-to-earn veterans, blockchain gaming investors
 - Speak to: game loops, token economics, player retention, onboarding non-crypto players
 - Hot topics 2026: fully on-chain games, AI-generated game content, real asset ownership
 
@@ -504,7 +504,7 @@ Be specific with details (even fictional specifics make it feel real: dates, amo
 The lesson at the end should be universally applicable.
 The reader should feel something, not just think something.
 Make them want to share it because it resonated emotionally.
-"""
+""",
 }
 
 # ─── NICHE-SPECIFIC ADDONS ────────────────────────────────────────────────────
@@ -565,12 +565,15 @@ Audience: gamers, game developers, play-to-earn veterans, blockchain gaming inve
 Speak their language: game loop, token sink, inflation, onboarding, real asset ownership, fully on-chain.
 Hot 2026 angles: fully on-chain games with real players, AI-generated game content, major studio adoption.
 Bridge the crypto-native and gaming-native perspectives.
-"""
+""",
 }
 
 # ─── EDIT INSTRUCTION PROMPT ──────────────────────────────────────────────────
+# FIX: renamed from EDIT_SYSTEM_PROMPT -> EDIT_PROMPT to match the name bot.py
+# actually imports ("from prompts import ... EDIT_PROMPT ..."). The old name
+# caused an ImportError that crashed the whole bot at startup.
 
-EDIT_SYSTEM_PROMPT = """
+EDIT_PROMPT = """
 You are the same Web3 KOL and builder. You've just written a piece of content and the user wants it modified.
 
 Make ONLY the requested changes. Keep everything else intact.
@@ -589,8 +592,12 @@ Use the same output format:
 """
 
 # ─── TOPIC SUGGESTION PROMPT ──────────────────────────────────────────────────
+# FIX: renamed from SUGGEST_TOPICS_PROMPT -> SUGGEST_PROMPT to match the name
+# bot.py imports. Also added "niche" to the JSON schema, since bot.py's
+# fmt_suggest() and the "usetopic:" callback both read t.get("niche") and
+# would otherwise always fall back to an empty/default value.
 
-SUGGEST_TOPICS_PROMPT = """
+SUGGEST_PROMPT = """
 You are a Web3 KOL with 9+ years experience. Generate 8 high-potential tweet/thread topic ideas for today.
 
 Consider:
@@ -599,23 +606,32 @@ Consider:
 - Content types that perform: personal lessons, hot takes, alpha drops, builder stories, market analysis
 - Avoid anything too generic or overposted
 
-Output format (JSON only, no other text):
+Output format (JSON only, no other text, no markdown code fences):
 {
   "topics": [
-    {"title": "short title", "hook": "the actual first line you'd use", "type": "tweet|thread", "why": "why this would perform well"},
-    ...
+    {
+      "title": "short title",
+      "hook": "the actual first line you'd use",
+      "type": "tweet|thread",
+      "niche": "defi|nft|l1l2|trading|ai_web3|memecoins|dao|gamefi",
+      "why": "why this would perform well"
+    }
   ]
 }
 """
 
 # ─── ENGAGEMENT SCORE PROMPT ──────────────────────────────────────────────────
+# FIX: changed JSON keys "top_strength"/"top_weakness" -> "strength"/"weakness"
+# so they match what bot.py's fmt_score() actually reads
+# (data.get("strength") / data.get("weakness")). With the old key names these
+# fields always rendered empty.
 
 SCORE_PROMPT = """
 You are an expert in X (Twitter) algorithm optimization and viral content analysis.
 
 Analyze this Web3 tweet/thread and score it across these dimensions (0-10 each):
 1. Hook strength (does the first line stop scrolling?)
-2. Reply potential (will people feel compelled to respond?)  
+2. Reply potential (will people feel compelled to respond?)
 3. Bookmark value (is this save-worthy information?)
 4. Repost potential (would people share this?)
 5. Algorithmic fit (2026 X algorithm compatibility)
@@ -623,7 +639,7 @@ Analyze this Web3 tweet/thread and score it across these dimensions (0-10 each):
 7. Niche relevance (will the target audience care?)
 8. Timing relevance (is this timely/relevant right now?)
 
-Output format (JSON only, no other text):
+Output format (JSON only, no other text, no markdown code fences):
 {
   "scores": {
     "hook": 0,
@@ -637,8 +653,8 @@ Output format (JSON only, no other text):
   },
   "overall": 0,
   "verdict": "one sentence verdict",
-  "top_strength": "the best thing about this content",
-  "top_weakness": "the one thing to improve",
+  "strength": "the best thing about this content",
+  "weakness": "the one thing to improve",
   "quick_fix": "one specific change that would improve score by 10-15%"
 }
 """
