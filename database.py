@@ -1,12 +1,13 @@
 """
 database.py — MySQL layer for Web3 Tweet Writer v3
-Uses PyMySQL with connection pooling and auto-reconnect.
+Uses PyMySQL with connection-per-call and auto-reconnect.
 """
+
+from __future__ import annotations  # FIX: enables `dict | None` style hints on Python 3.9
 
 import os
 import json
 import logging
-from datetime import datetime
 from contextlib import contextmanager
 
 import pymysql
@@ -18,6 +19,7 @@ DB_URL = os.getenv(
     "DATABASE_URL",
     "mysql://root:OjlRFNSuIIuietVenDQmeThUUFRwDssZ@thomas.proxy.rlwy.net:27871/railway"
 )
+
 
 def _parse_url(url: str) -> dict:
     """Parse mysql://user:pass@host:port/db into a dict."""
@@ -31,6 +33,7 @@ def _parse_url(url: str) -> dict:
     else:
         host, port = host_port, 3306
     return dict(host=host, port=port, user=user, password=password, db=db)
+
 
 _DB = _parse_url(DB_URL)
 
@@ -116,7 +119,7 @@ def save_generation(topic, content, content_type, tone, niche, model_used, score
         return cur.lastrowid
 
 
-def get_history(limit=10) -> list:
+def get_history(limit: int = 10) -> list:
     with cursor() as cur:
         cur.execute(
             "SELECT * FROM generations ORDER BY created_at DESC LIMIT %s", (limit,)
@@ -124,7 +127,7 @@ def get_history(limit=10) -> list:
         return cur.fetchall()
 
 
-def get_generation(gen_id: int) -> dict | None:
+def get_generation(gen_id: int):  # FIX: was -> dict | None (3.10+ syntax); future import handles it, kept plain too
     with cursor() as cur:
         cur.execute("SELECT * FROM generations WHERE id = %s", (gen_id,))
         return cur.fetchone()
@@ -140,7 +143,7 @@ def delete_generation(gen_id: int):
         cur.execute("DELETE FROM generations WHERE id = %s", (gen_id,))
 
 
-def search_generations(query: str, limit=5) -> list:
+def search_generations(query: str, limit: int = 5) -> list:
     with cursor() as cur:
         cur.execute(
             "SELECT * FROM generations WHERE topic LIKE %s ORDER BY created_at DESC LIMIT %s",
