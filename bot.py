@@ -41,8 +41,8 @@ from prompts import (
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8832243793:AAEy3u0BD-_pyI5QrBLIE8GOHxNZTYxCBZE")
 ADMIN_ID       = int(os.getenv("ADMIN_ID", "5825181230"))
-DEEPSEEK_KEY   = os.getenv("DEEPSEEK_API_KEY", "sk-b7b1b286f54749889e7503b6494ac6e0")
 NVIDIA_KEY     = os.getenv("NVIDIA_API_KEY", "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")
+# DeepSeek removed — account returned HTTP 402 Insufficient Balance. NVIDIA is now the sole provider.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -59,8 +59,7 @@ log = logging.getLogger("TweetBot")
 # AI CLIENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
-nvidia   = OpenAI(api_key=NVIDIA_KEY,   base_url="https://integrate.api.nvidia.com/v1")
+nvidia = OpenAI(api_key=NVIDIA_KEY, base_url="https://integrate.api.nvidia.com/v1")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -167,16 +166,6 @@ def _build_user_msg(topic: str, fmt: str, history: list) -> str:
     )
 
 
-def _call_deepseek(messages: list, temp: float = 0.88, max_tok: int = 2000) -> str:
-    r = deepseek.chat.completions.create(
-        model="deepseek-chat",
-        messages=messages,
-        temperature=temp,
-        max_tokens=max_tok,
-    )
-    return r.choices[0].message.content.strip()
-
-
 def _call_nvidia(messages: list, temp: float = 0.88, max_tok: int = 2000) -> str:
     r = nvidia.chat.completions.create(
         model="meta/llama-3.3-70b-instruct",
@@ -194,29 +183,14 @@ async def generate(
     niche: str,
     history: list,
     force: str = "auto",
-) -> tuple:  # FIX: was tuple[str, str] — requires Python 3.10+; use plain tuple for 3.9 compat
-    """Returns (content, model_label). Auto tries DeepSeek → NVIDIA fallback."""
+) -> tuple:
+    """Returns (content, model_label). NVIDIA is the only provider."""
     msgs = [
         {"role": "system", "content": _build_system(tone, niche)},
         {"role": "user",   "content": _build_user_msg(topic, fmt, history)},
     ]
-
-    if force == "nvidia":
-        content = await asyncio.to_thread(_call_nvidia, msgs)
-        return content, "NVIDIA"
-
-    if force == "deepseek":
-        content = await asyncio.to_thread(_call_deepseek, msgs)
-        return content, "DeepSeek"
-
-    # auto: DeepSeek first, NVIDIA fallback
-    try:
-        content = await asyncio.to_thread(_call_deepseek, msgs)
-        return content, "DeepSeek"
-    except Exception as e:
-        log.warning(f"DeepSeek failed ({e}), falling back to NVIDIA")
-        content = await asyncio.to_thread(_call_nvidia, msgs)
-        return content, "NVIDIA ↩️"
+    content = await asyncio.to_thread(_call_nvidia, msgs)
+    return content, "NVIDIA"
 
 
 async def ai_edit(original: str, instruction: str) -> str:
@@ -224,19 +198,16 @@ async def ai_edit(original: str, instruction: str) -> str:
         {"role": "system", "content": EDIT_PROMPT},
         {"role": "user",   "content": f"ORIGINAL:\n{original}\n\nINSTRUCTION: {instruction}"},
     ]
-    try:
-        return await asyncio.to_thread(_call_deepseek, msgs, 0.8)
-    except Exception:
-        return await asyncio.to_thread(_call_nvidia, msgs, 0.8)
+    return await asyncio.to_thread(_call_nvidia, msgs, 0.8)
 
 
-async def ai_score(content: str):  # FIX: was -> dict | None (Python 3.10+ syntax)
+async def ai_score(content: str):
     msgs = [
         {"role": "system", "content": SCORE_PROMPT},
         {"role": "user",   "content": content},
     ]
     try:
-        raw = await asyncio.to_thread(_call_deepseek, msgs, 0.2, 600)
+        raw = await asyncio.to_thread(_call_nvidia, msgs, 0.2, 600)
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
         return json.loads(raw)
     except Exception as e:
@@ -250,7 +221,7 @@ async def ai_suggest() -> list:
         {"role": "user",   "content": "Generate 8 high-potential Web3 content ideas for right now."},
     ]
     try:
-        raw = await asyncio.to_thread(_call_deepseek, msgs, 0.92, 1400)
+        raw = await asyncio.to_thread(_call_nvidia, msgs, 0.92, 1400)
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
         return json.loads(raw).get("topics", [])
     except Exception as e:
@@ -321,20 +292,19 @@ def kb_settings(prefs: dict):
 def kb_post(gen_id: int):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Score",         callback_data=f"score:{gen_id}"),
-            InlineKeyboardButton("✏️ Edit",           callback_data=f"edit:{gen_id}"),
+            InlineKeyboardButton("📊 Score",    callback_data=f"score:{gen_id}"),
+            InlineKeyboardButton("✏️ Edit",      callback_data=f"edit:{gen_id}"),
         ],
         [
-            InlineKeyboardButton("🔄 Redo DeepSeek", callback_data=f"redo:deepseek:{gen_id}"),
-            InlineKeyboardButton("⚡ Redo NVIDIA",   callback_data=f"redo:nvidia:{gen_id}"),
+            InlineKeyboardButton("🔄 Redo",      callback_data=f"redo:nvidia:{gen_id}"),
+            InlineKeyboardButton("🎲 Alt Tone",  callback_data=f"alttone:{gen_id}"),
         ],
         [
-            InlineKeyboardButton("🎲 Alt Tone",      callback_data=f"alttone:{gen_id}"),
-            InlineKeyboardButton("🧵 → Thread",      callback_data=f"tothread:{gen_id}"),
+            InlineKeyboardButton("🧵 → Thread",  callback_data=f"tothread:{gen_id}"),
+            InlineKeyboardButton("🗑 Delete",     callback_data=f"delete:{gen_id}"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete",         callback_data=f"delete:{gen_id}"),
-            InlineKeyboardButton("🏠 Home",           callback_data="menu:home"),
+            InlineKeyboardButton("🏠 Home",      callback_data="menu:home"),
         ],
     ])
 
